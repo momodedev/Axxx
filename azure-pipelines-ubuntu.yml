@@ -1,0 +1,35 @@
+# Go
+# Build your Go project.
+# Add steps that test, save build artifacts, deploy, and more:
+# https://docs.microsoft.com/azure/devops/pipelines/languages/go
+
+trigger:
+- source_change
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  GOBIN:  '$(GOPATH)/bin' # Go binaries path
+  GOROOT: '/usr/local/go1.11' # Go installation path
+  GOPATH: '$(system.defaultWorkingDirectory)/gopath' # Go workspace path
+  modulePath: '$(GOPATH)/src/github.com/$(build.repository.name)' # Path to the module's code
+
+steps:
+- task: GoTool@0
+  displayName: 'Use Go 1.10'
+
+- task: Go@0
+  displayName: 'go get'
+  inputs:
+    arguments: '-d'
+
+- task: Go@0
+  displayName: 'go build'
+  inputs:
+    command: build
+    arguments: '-o "$(System.TeamProject).exe"'
+
+- task: PublishBuildArtifacts@1
+  displayName: 'Publish artifact'
+  condition: succeededOrFailed()

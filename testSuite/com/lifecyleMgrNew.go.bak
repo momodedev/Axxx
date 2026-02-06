@@ -1,0 +1,1357 @@
+package com
+
+import (
+	"bufio"
+	"context"
+	"crypto/tls"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math/rand"
+	"net/http"
+	"net/url"
+	"os"
+	"os/signal"
+	"path"
+	"reflect"
+	"runtime"
+	"runtime/pprof"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/Azure/azure-sdk-for-go/sdk/keyvault/azsecrets"
+	"github.com/Azure/azure-storage-azcopy/v10/azblobmgr"
+	"github.com/Azure/azure-storage-azcopy/v10/config"
+	"github.com/Azure/azure-storage-azcopy/v10/dbmgr"
+	"github.com/Azure/azure-storage-azcopy/v10/util"
+	"github.com/Azure/azure-storage-blob-go/azblob"
+	goredis "github.com/go-redis/redis/v8"
+	"github.com/gogf/gf/os/glog"
+	"github.com/google/uuid"
+	"github.com/minio/minio-go"
+
+	"github.com/Azure/azure-pipeline-go/pipeline"
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
+)
+
+const (
+	Copy = "copy"
+
+	Remove = "remove"
+
+	Redis_Host = "REDIS_HOST"
+
+	Redis_PWD = "REDIS_PWD"
+
+	Full_EventHub_ConnStr = "FULL_EVENTHUB_CONNSTR"
+	Full_EventHub_Task    = "FULL_EVENTHUB_TASK"
+	Full_EventHub_Job     = "FULL_EVENTHUB_JOB"
+
+	Delta_EventHub_ConnStr    = "DELTA_EVENTHUB_CONNSTR"
+	Delta_EventHub_UpsertTask = "DELTA_EVENTHUB_UPSERTTASK"
+	Delta_EventHub_UpsertJob  = "DELTA_EVENTHUB_UPSERTJOB"
+
+	Delta_EventHub_DeleteTask = "DELTA_EVENTHUB_DELETETASK"
+	Delta_EventHub_DeleteJob  = "DELTA_EVENTHUB_DELETEJOB"
+
+	Debug_Mode = "DEBUG_MODE"
+
+	Job_Status_Failed = -1
+
+	Job_Status_SkippedSuccess = 1
+
+	Job_Delete_Message_SkilledSuccess = "File exists in source, skipped"
+
+	Job_Delete_Message_SkilledFail = "File is not existing in target, failed"
+
+	Task_Type = "TASK_TYPE"
+
+	Task_Max_File = 1000
+)
+
+// only one instance of the formatter should exist
+var lcmn = func() (lcmgrn *LifecycleMgrNew) {
+	lcmgrn = &LifecycleMgrNew{
+		msgQueue:             make(chan outputMessage, 1000),
+		progressCache:        "",
+		cancelChannel:        make(chan os.Signal, 1),
+		e2eContinueChannel:   make(chan struct{}),
+		e2eAllowOpenChannel:  make(chan struct{}),
+		outputFormat:         EOutputFormat.Text(), // output text by default
+		logSanitizer:         NewAzCopyLogSanitizer(),
+		inputQueue:           make(chan userInput, 1000),
+		allowCancelFromStdIn: false,
+		allowWatchInput:      false,
+		closeFunc:            func() {}, // noop since we have nothing to do by default
+		waitForUserResponse:  make(chan bool),
+		msgHandlerChannel:    make(chan *LCMMsg),
+	}
+
+	// kick off the single routine that processes output
+	go lcmgrn.processOutputMessage()
+
+	// and process input
+	go lcmgrn.watchInputs()
+
+	// Check if need to do CPU profiling, and do CPU profiling accordingly when azcopy life start.
+	lcmgrn.checkAndStartCPUProfiling()
+
+	return
+}()
+
+// create a public interface so that consumers outside of this package can refer to the lifecycle manager
+// but they would not be able to instantiate one
+type LifecycleMgrNew interface {
+	Init(OutputBuilder)                                          // let the user know the job has started and initial information like log location
+	Progress(OutputBuilder)                                      // print on the same line over and over again, not allowed to float up
+	Exit(OutputBuilder, ExitCode)                                // indicates successful execution exit after printing, allow user to specify exit code
+	Info(string)                                                 // simple print, allowed to float up
+	Dryrun(OutputBuilder)                                        // print files for dry run mode
+	Error(string)                                                // indicates fatal error, exit after printing, exit code is always Failed (1)
+	Prompt(message string, details PromptDetails) ResponseOption // ask the user a question(after erasing the progress), then return the response
+	SurrenderControl()                                           // give up control, this should never return
+	InitiateProgressReporting(WorkController)                    // start writing progress with another routine
+	AllowReinitiateProgressReporting()                           // allow re-initiation of progress reporting for followup job
+	GetEnvironmentVariable(EnvironmentVariable) string           // get the environment variable or its default value
+	ClearEnvironmentVariable(EnvironmentVariable)                // clears the environment variable
+	SetOutputFormat(OutputFormat)                                // change the output format of the entire application
+	EnableInputWatcher()                                         // depending on the command, we may allow user to give input through Stdin
+	EnableCancelFromStdIn()                                      // allow user to send in `cancel` to stop the job
+	AddUserAgentPrefix(string) string                            // append the global user agent prefix, if applicable
+	E2EAwaitContinue()                                           // used by E2E tests
+	E2EAwaitAllowOpenFiles()                                     // used by E2E tests
+	E2EEnableAwaitAllowOpenFiles(enable bool)                    // used by E2E tests
+	RegisterCloseFunc(func())
+	SetForceLogging()
+	IsForceLoggingDisabled() bool
+	DownloadToTempPath() bool
+	MsgHandlerChannel() <-chan *LCMMsg
+	ReportAllJobPartsDone()
+	SetOutputVerbosity(mode OutputVerbosity)
+	LoadConfigurationFileFromYaml(taskID string, jobID string)
+	SetOverwriteIfNew(overwriteValue string)
+	GetOverwriteIfNew() bool
+	GetJobDataFromjsonfile(taskId string, jobId string) []string
+	ConvertRedisDataToMinioObjectInfo(bucketName string, objKey string) (minio.ObjectInfo, error)
+	GetJobDataFromMapWithKey(key string) dbmgr.JobData
+	deleteRedisJobsWhenFinished()
+	SetTaskExecutionStartTime()
+	GetKeyVault()
+	GetAzureKeys(jobId string)
+	SubmitTaskResultToeEventHub(totalJobs int, skippedJob int, finishedJob int, failedJob int, totalTransferBytes int)
+	SetSingleJobDataToEventhub(fileName string, status int, message string, statusCode int)
+	SubmitJobLogBeforeCmd(jobItem dbmgr.JobData, message string, jobStatus int)
+	getTaskType() string
+}
+
+func GetLifecycleMgrNew() LifecycleMgrNew {
+	return *lcmn
+}
+
+// single point of control for all outputs
+type LifecycleMgrNew struct {
+	msgQueue              chan outputMessage
+	progressCache         string // useful for keeping job progress on the last line
+	cancelChannel         chan os.Signal
+	doneChannel           chan bool
+	e2eContinueChannel    chan struct{}
+	e2eAllowOpenChannel   chan struct{}
+	waitEverCalled        int32
+	outputFormat          OutputFormat
+	logSanitizer          pipeline.LogSanitizer
+	inputQueue            chan userInput // msgs from the user
+	allowWatchInput       bool           // accept user inputs and place then in the inputQueue
+	allowCancelFromStdIn  bool           // allow user to send in 'cancel' from the stdin to stop the current job
+	e2eAllowAwaitContinue bool           // allow the user to send 'continue' from stdin to start the current job
+	e2eAllowAwaitOpen     bool           // allow the user to send 'open' from stdin to allow the opening of the first file
+	closeFunc             func()         // used to close logs before exiting
+	disableSyslog         bool
+	waitForUserResponse   chan bool
+	msgHandlerChannel     chan *LCMMsg
+	OutputVerbosityType   OutputVerbosity
+
+	JobDataRedisClient *goredis.Client
+	FileSlice          map[string]dbmgr.JobData
+	YamlConfig         *config.Config
+	TaskType           string
+	TaskIDFromParam    string
+	JobIDFromParam     string
+	OverwriteIfNew     bool
+	AzBlobMgr          *azblobmgr.AzBlobMgr
+	KeyVaultClient     *azsecrets.Client
+	S3SourceURLPrefix  string
+	AzBlobURLPrefix    string
+	CosmosPKRange      int
+	AzTaskResultMgr    *dbmgr.AzTaskResultMgr
+	AzJobResultMgr     *dbmgr.AzJobResultMgr
+	DebugMode          int
+	SkippedDelNum      int
+}
+
+type userInput struct {
+	timeReceived time.Time
+	content      string
+}
+
+func (lcmn *LifecycleMgrNew) getTaskType() string {
+
+	return lcmn.TaskType
+}
+
+// LoadConfigurationFileFromYaml loads config.yaml file into config.Config struct
+// The DEBUG_MODE now read from system Env.
+func (lcmn *LifecycleMgrNew) LoadConfigurationFileFromYaml(taskID string, jobID string) {
+	lcmn.TaskIDFromParam = taskID
+	lcmn.JobIDFromParam = jobID
+	debugMode, _ := strconv.Atoi(os.Getenv("DEBUG_MODE"))
+	lcmn.DebugMode = debugMode
+}
+
+// getAzureKeyFromRedisOrKeyVault get value with key from Redis.
+// If the key is not exist in Redis, read from Key Vault and cache it into Redis
+func getAzureKeyFromRedisOrKeyVault(key string) string {
+	val := dbmgr.GetRedisKey(key, lcmn.JobDataRedisClient)
+	if len(val) == 0 {
+		val = getKeyVaultKey(key)
+		if len(val) != 0 {
+			err := lcmn.JobDataRedisClient.Set(context.Background(), key, val, 0).Err()
+			if err != nil {
+				fmt.Printf("can't cache key %s to redis", key)
+			}
+		}
+
+	}
+	return val
+}
+
+// GetKeyVault get keys from Key Vault if Redis is not exist.
+func (lcmn *LifecycleMgrNew) GetKeyVault() {
+
+	if lcmn.KeyVaultClient == nil {
+		keyVaultUrl := os.Getenv("KeyVaultURI")
+		if len(keyVaultUrl) == 0 {
+			glog.Error("can't get KeyVaultURI from env")
+			os.Exit(-1)
+		}
+		cred, err := azidentity.NewDefaultAzureCredential(nil)
+		if err != nil {
+			glog.Error("failed to obtain a credential:%s \n %s", keyVaultUrl, err)
+			os.Exit(-1)
+		}
+		// create azkeys client
+		client, err := azsecrets.NewClient(keyVaultUrl, cred, nil)
+		if err != nil {
+			glog.Error("azure key vault init client failed", err)
+			os.Exit(-1)
+		}
+		lcmn.KeyVaultClient = client
+	}
+
+}
+
+func getKeyVaultKey(key string) string {
+	if lcmn.KeyVaultClient == nil {
+		keyVaultUrl := os.Getenv("KeyVaultURI")
+		if len(keyVaultUrl) == 0 {
+			glog.Error("can't get KeyVaultURI from env")
+			os.Exit(-1)
+		}
+		cred, err := azidentity.NewDefaultAzureCredential(nil)
+		if err != nil {
+			glog.Error("failed to obtain a credential:%s \n %s", keyVaultUrl, err)
+			os.Exit(-1)
+		}
+		// create azkeys client
+		client, err := azsecrets.NewClient(keyVaultUrl, cred, nil)
+		if err != nil {
+			glog.Errorf("azure key vault init client failed: %s", err)
+			os.Exit(-1)
+		}
+		lcmn.KeyVaultClient = client
+	}
+	//fmt.Print(lcmn.KeyVaultClient)
+	var keyVaultVal string = ""
+	resp, err := lcmn.KeyVaultClient.GetSecret(context.TODO(), key, "", nil)
+	if err != nil {
+		glog.Errorf("key %s is null: %s", key, err)
+	}
+
+	keyVaultVal = *resp.Value
+	if len(keyVaultVal) == 0 {
+		glog.Errorf("key %s is null", keyVaultVal)
+		os.Exit(-1)
+	}
+	return keyVaultVal
+}
+
+func (lcmn *LifecycleMgrNew) SetOverwriteIfNew(overwriteValue string) {
+	if overwriteValue == "IfSourceNewer" {
+		lcmn.OverwriteIfNew = true
+	}
+	lcmn.OverwriteIfNew = false
+}
+
+func (lcmn *LifecycleMgrNew) GetOverwriteIfNew() bool {
+	return lcmn.OverwriteIfNew
+}
+
+func (lcmn *LifecycleMgrNew) GetJobDataFromMapWithKey(key string) dbmgr.JobData {
+	return lcmn.FileSlice[key]
+}
+
+// deleteRedisJobsWhenFinished delete redis key when task is finished, only work in non debug mode.
+func (lcmn *LifecycleMgrNew) deleteRedisJobsWhenFinished() {
+	//if lcmn.YamlConfig.DEBUG_MODE != 1 {
+	if os.Getenv(Debug_Mode) != "1" {
+		err := lcmn.JobDataRedisClient.Del(context.TODO(), lcmn.TaskIDFromParam).Err()
+		if err != nil {
+			glog.Errorf("Cannot Delete Job "+lcmn.TaskIDFromParam+" in Redis: err", err)
+		}
+	}
+}
+
+// SetTaskExecutionStartTime add a task start time
+func (lcmn *LifecycleMgrNew) SetTaskExecutionStartTime() {
+	//dbmgr.SetTaskStartTimeWithRestAPI(lcmn.YamlConfig, lcmn.TaskIDFromParam, lcmn.JobIDFromParam)
+	lcmn.AzTaskResultMgr.AzTaskResultData.ExecutionStartTime = time.Now().Format(time.RFC3339)
+
+}
+
+// ConvertRedisDataToMinioObjectInfo read job data from lcmn.FileSlice and convert it into Minio ObjectInfo.
+func (lcmn *LifecycleMgrNew) ConvertRedisDataToMinioObjectInfo(bucketName string, objKey string) (minio.ObjectInfo, error) {
+	mapKey := fmt.Sprintf("%s/%s", bucketName, objKey)
+
+	if value, ok := lcmn.FileSlice[mapKey]; ok {
+		lastModifyTime, _ := time.Parse(time.RFC3339, value.ModifyTime)
+		metadataHeader := http.Header{}
+		if len(value.VersionId) != 0 {
+			metadataHeader.Set("X-Amz-Version-Id", value.VersionId)
+		}
+		return minio.ObjectInfo{
+			ETag:         value.Etag,
+			Key:          objKey,
+			LastModified: lastModifyTime,
+			Size:         int64(value.Size),
+			ContentType:  "",
+			Metadata:     metadataHeader,
+			Owner: struct {
+				DisplayName string `json:"name"`
+				ID          string `json:"id"`
+			}{},
+			StorageClass: value.StorageClass,
+			Err:          nil,
+		}, nil
+	}
+	return minio.ObjectInfo{}, errors.New(fmt.Sprintf("Cannot Find bucket %s and obj key %s", bucketName, objKey))
+}
+
+func trimStringFields(job *dbmgr.JobData) {
+	v := reflect.ValueOf(job).Elem() // Getting the value that the pointer 'job' points to
+	for i := 0; i < v.NumField(); i++ {
+		field := v.Field(i) // Check if the field is of type string
+		if field.Kind() == reflect.String {
+			trimmedValue := strings.TrimSpace(field.String()) // Trim the field
+			field.SetString(trimmedValue)                     // Set back the trimmed value
+		}
+	}
+}
+
+// GetJobDataFromRedis read task detail information from redis.
+// Add detail information to map lcmn.FileSlice.
+// Add transfer file names into temp file (txt).
+// Rewrite "-t -j" args into Azcopy args.
+// Return rewrote Azcopy args.
+func (lcmn *LifecycleMgrNew) GetJobDataFromjsonfile(taskId string, jobId string) []string {
+	var bkName, bkRegion string
+	azBlobContainer := os.Getenv("AZ_BLOB_CONTAINER")
+	result := []string{}
+
+	isValid, taskType := util.GetTaskTypeFromFileName(taskId)
+
+	if !isValid {
+
+		glog.Errorf("file name %s is not valid", taskId)
+		os.Exit(1)
+
+	}
+
+	lcmn.TaskType = taskType
+	os.Setenv(util.TaskTypeDeltaDelete, taskType) //for delete
+
+	if lcmn.TaskType == util.TaskTypeFull {
+
+		lcmn.AzTaskResultMgr = dbmgr.GetTaskEventHubClient(os.Getenv(Full_EventHub_ConnStr), os.Getenv(Full_EventHub_Task))
+		lcmn.AzJobResultMgr = dbmgr.GetJobEventHubClient(os.Getenv(Full_EventHub_ConnStr), os.Getenv(Full_EventHub_Job))
+	}
+
+	if lcmn.TaskType == util.TaskTypeDeltaUpsert {
+
+		lcmn.AzTaskResultMgr = dbmgr.GetTaskEventHubClient(os.Getenv(Delta_EventHub_ConnStr), os.Getenv(Delta_EventHub_UpsertTask))
+		lcmn.AzJobResultMgr = dbmgr.GetJobEventHubClient(os.Getenv(Delta_EventHub_ConnStr), os.Getenv(Delta_EventHub_UpsertJob))
+	}
+
+	if lcmn.TaskType == util.TaskTypeDeltaDelete {
+		lcmn.AzTaskResultMgr = dbmgr.GetTaskEventHubClient(os.Getenv(Delta_EventHub_ConnStr), os.Getenv(Delta_EventHub_DeleteTask))
+		lcmn.AzJobResultMgr = dbmgr.GetJobEventHubClient(os.Getenv(Delta_EventHub_ConnStr), os.Getenv(Delta_EventHub_DeleteJob))
+	}
+
+	jsonFile, err := os.Open(taskId + ".json")
+	if err != nil {
+		panic(err)
+	}
+	defer jsonFile.Close()
+	// Create a JSON Decoder
+	decoder := json.NewDecoder(jsonFile)
+	// Read opening bracket for the array of JSON objects
+	_, err = decoder.Token()
+	if err != nil {
+		glog.Error("Error reading opening bracket: ", err)
+		panic(err)
+	}
+	// Initialize the slice with capacity
+	newJob := make([]dbmgr.JobData, 0, 1000)
+	// Decode each JSON object
+	for decoder.More() {
+		var job dbmgr.JobData
+		err := decoder.Decode(&job)
+		if err != nil {
+			glog.Error("Error decoding JSON: ", err)
+			panic(err)
+		}
+		newJob = append(newJob, job)
+	}
+	// Check for the closing bracket of the array
+	_, err = decoder.Token()
+	if err != nil {
+		glog.Error("Error reading closing bracket: ", err)
+		panic(err)
+	}
+
+	connStr := os.Getenv("AZ_BLOB_CONN_STRING")
+	if len(connStr) == 0 {
+		glog.Error("blob connection string is empty")
+	}
+	appInfo := util.ParseAzBlobConnString(connStr)
+	blobClient := azblobmgr.GetAzBlobContainerClient(appInfo)
+	lcmn.AzBlobMgr = blobClient
+	blobClient.GenerateSAS(appInfo)
+	destUrl := blobClient.URLBuilder(azBlobContainer, bkName)
+	lcmn.AzBlobURLPrefix = blobClient.URLPrefixBuilder(azBlobContainer, bkName)
+
+	wholeMap := make(map[string]dbmgr.JobData, len(newJob))
+	resultMap := make(map[string]dbmgr.JobData, len(newJob))
+	lcmn.SkippedDelNum = 0
+
+	for _, jobItem := range newJob {
+		trimStringFields(&jobItem)
+		bkName = jobItem.BucketName
+		bkRegion = jobItem.Region
+
+		if lcmn.TaskType == util.TaskTypeDeltaDelete {
+
+			if checkS3FileExist(bkName, jobItem.FilePath, jobItem.Region) { //S3 exists
+
+				wholeMap[fmt.Sprintf("/%s/%s", azBlobContainer, jobItem.FilePath)] = jobItem
+
+				lcmn.SkippedDelNum = lcmn.SkippedDelNum + 1
+
+				lcmn.SubmitJobLogBeforeCmd(jobItem, Job_Delete_Message_SkilledSuccess, Job_Status_SkippedSuccess)
+
+			} else { //end if check
+
+				glog.Infof("File %s is not existing in S3.", jobItem.SourceUrl)
+
+				wholeMap[fmt.Sprintf("/%s/%s", azBlobContainer, jobItem.FilePath)] = jobItem
+
+				if !isSingleBlobForDel(jobItem.FilePath) {
+
+					lcmn.SubmitJobLogBeforeCmd(jobItem, Job_Delete_Message_SkilledFail, Job_Status_Failed)
+				} else {
+
+					resultMap[fmt.Sprintf("/%s/%s", azBlobContainer, jobItem.FilePath)] = jobItem
+				}
+
+			}
+
+		} else {
+
+			resultMap[fmt.Sprintf("%s/%s", jobItem.BucketName, jobItem.FilePath)] = jobItem
+
+			wholeMap[fmt.Sprintf("%s/%s", jobItem.BucketName, jobItem.FilePath)] = jobItem
+		}
+
+	}
+
+	lcmn.FileSlice = wholeMap
+
+	listFile := createTempFile(resultMap, lcmn.TaskIDFromParam)
+
+	for index, item := range os.Args {
+		//630
+		if index == 1 && item == Copy {
+			result = append(result, Copy)
+			continue
+		}
+		if index == 1 && item == Remove {
+			result = append(result, Remove)
+			continue
+		}
+		switch item {
+		case "-t", "-j", taskId, jobId:
+			continue
+		default:
+			result = append(result, item)
+		}
+
+	}
+
+	sourceUrlPresfix := fmt.Sprintf("https://%s.s3.%s.amazonaws.com", bkName, bkRegion)
+	lcmn.S3SourceURLPrefix = sourceUrlPresfix + "/"
+	// lcmn.AzBlobURLPrefix = blobClient.URLPrefixBuilder(azBlobContainer, bkName)
+
+	if lcmn.TaskType == util.TaskTypeDeltaDelete {
+		// lcmn.AzTaskResultMgr = dbmgr.GetTaskEventHubClient(os.Getenv(Delta_EventHub_ConnStr), os.Getenv(Delta_EventHub_DeleteTask))
+		// lcmn.AzJobResultMgr = dbmgr.GetJobEventHubClient(os.Getenv(Delta_EventHub_ConnStr), os.Getenv(Delta_EventHub_DeleteJob))
+		result = append(result, destUrl, "--recursive=true",
+			"--list-of-files",
+			listFile)
+	} else {
+		result = append(result, sourceUrlPresfix, destUrl,
+			"--list-of-files",
+			listFile)
+	}
+
+	return result
+	// []string{
+	// 	"azcopy",
+	// 	"copy",
+	// 	fmt.Sprintf("https://%s.s3.%s.amazonaws.com", bkName, bkRegion),
+	// 	destUrl,
+	// 	"--list-of-files",
+	// 	listFile,
+	// }
+}
+
+func (lcmn *LifecycleMgrNew) SubmitJobLogBeforeCmd(jobItem dbmgr.JobData, message string, jobStatus int) {
+
+	jobData := dbmgr.AzJobResultData{
+		Id:             uuid.New().String(),
+		JobId:          lcmn.JobIDFromParam,
+		TaskId:         lcmn.TaskIDFromParam,
+		TaskType:       lcmn.TaskType,
+		Message:        message,
+		OperationTime:  time.Now().Format(time.RFC3339),
+		ModifyTime:     jobItem.ModifyTime,
+		StorageClass:   jobItem.StorageClass,
+		StatusCode:     jobStatus,
+		Size:           jobItem.Size,
+		SourceURL:      jobItem.SourceUrl,
+		DestinationURL: lcmn.AzBlobURLPrefix + jobItem.FilePath,
+	}
+	lcmn.AzJobResultMgr.SetAzJobResult(jobData)
+
+}
+
+func checkS3FileExist(bucketName, fileName string, region string) bool {
+	sess := session.Must(session.NewSessionWithOptions(session.Options{SharedConfigState: session.SharedConfigEnable}))
+	sess.Config.Region = &region
+	//sess := session.Must(session.NewSession(&aws.Config{ Region: aws.String(region), }))
+	s3svc := s3.New(sess)
+	_, err := s3svc.HeadObject(&s3.HeadObjectInput{Bucket: aws.String(bucketName), Key: aws.String(fileName)})
+	return err == nil
+}
+
+func isSingleBlobForDel(blobName string) (isBlob bool) {
+
+	blobURL := lcmn.AzBlobMgr.ContainerClient.NewBlobURL(blobName)
+	// Here, we try to fetch the blob's properties
+	_, err := blobURL.GetProperties(context.Background(), azblob.BlobAccessConditions{}, azblob.ClientProvidedKeyOptions{})
+	if err != nil {
+		// An error occurred, possibly because the blob does not exist or due to other reasons like network issues.
+		if azblob.StorageErrorCodeType(err.Error()) == azblob.StorageErrorCodeBlobNotFound {
+			glog.Infof("Blob %s does not exist in the container \n", lcmn.AzBlobURLPrefix+blobName)
+			return false
+		} else {
+			glog.Infof("Blob %s is not found \n", lcmn.AzBlobURLPrefix+blobName)
+			return false
+		}
+	} else {
+		glog.Info("Blob %s exists in the container \n", lcmn.AzBlobURLPrefix+blobName)
+		return true
+	}
+}
+
+func createTempFile(data map[string]dbmgr.JobData, taskId string) string {
+	tempFile := path.Join(os.TempDir(), taskId)
+	file, err := os.OpenFile(tempFile, os.O_WRONLY|os.O_CREATE, 0777)
+	writer := bufio.NewWriter(file)
+	if err != nil {
+		panic(err)
+	}
+	defer file.Close()
+	tVal, tq := "", ""
+	for _, val := range data {
+
+		tq, err = url.QueryUnescape(val.FilePath)
+		if err != nil {
+			tVal = val.FilePath
+		} else {
+			tVal = tq
+		}
+		writer.WriteString(tVal + "\n")
+	}
+	writer.Flush()
+	return tempFile
+}
+
+// SetSingleTaskDataToCosmos add single task result data into eventhub  with random partition key.
+func (lcmn *LifecycleMgrNew) SetSingleJobDataToEventhub(fileName string, status int, message string, statusCode int) {
+	//taskType := os.Getenv("TASKTYPE_FROM_FILENAME")
+	bucketName := os.Getenv("SOURCE_BUCKET")
+	//for debug
+	//bucketName := "emr-testing-lgj"
+	taskType := lcmn.TaskType
+	var jobObj dbmgr.JobData
+	//jobObj := lcmn.FileSlice[fmt.Sprintf("%s/%s", bucketName, fileName)]
+	if taskType == util.TaskTypeDeltaDelete {
+
+		jobObj = lcmn.FileSlice[fileName]
+	} else {
+
+		jobObj = lcmn.FileSlice[fmt.Sprintf("%s%s", bucketName, fileName)]
+	}
+
+	rand.Seed(time.Now().UnixNano())
+	jobData := dbmgr.AzJobResultData{
+		Id:             uuid.New().String(),
+		JobId:          lcmn.JobIDFromParam,
+		TaskId:         lcmn.TaskIDFromParam,
+		TaskType:       taskType,
+		Message:        message,
+		OperationTime:  time.Now().Format(time.RFC3339),
+		ModifyTime:     jobObj.ModifyTime,
+		StorageClass:   jobObj.StorageClass,
+		StatusCode:     statusCode,
+		Size:           jobObj.Size,
+		SourceURL:      lcmn.S3SourceURLPrefix,
+		DestinationURL: lcmn.AzBlobURLPrefix + fileName,
+	}
+	lcmn.AzJobResultMgr.SetAzJobResult(jobData)
+}
+
+func (lcmn *LifecycleMgrNew) SubmitTaskResultToeEventHub(totalJobs int, skippedJob int, finishedJob int, failedJob int, totalTransferBytes int) {
+	os.Remove(path.Join(os.TempDir(), lcmn.TaskIDFromParam))
+
+	var totalSize int64 = 0
+	for _, value := range lcmn.FileSlice {
+		totalSize += value.Size
+	}
+
+	var numCopyJob int = skippedJob + finishedJob + failedJob
+	var numJobOfTask int = len(lcmn.FileSlice)
+	var numOfNonCopy int = numJobOfTask - numCopyJob - lcmn.SkippedDelNum //for copy is 0
+	failedJob = failedJob + numOfNonCopy
+	skippedJob = skippedJob + lcmn.SkippedDelNum
+
+	if numJobOfTask > numCopyJob && numOfNonCopy > 0 && lcmn.TaskType != util.TaskTypeDeltaDelete {
+
+		lcmn.AzTaskResultMgr.AzTaskResultData.NumberOfFiles = numOfNonCopy
+		glog.Warningf("The number of Skipped Job %d + Finished Job %d + Failed Job %d does not match Total Number of Jobs %d", skippedJob, finishedJob, failedJob, totalJobs)
+		lcmn.AzTaskResultMgr.SetAzTaskResult(lcmn.TaskIDFromParam, lcmn.TaskType, false, 0, 0, failedJob, 0, 0)
+	}
+
+	var isComplete bool = false
+
+	if failedJob <= util.NewJobFailRateCalculator(numJobOfTask) {
+
+		isComplete = true
+	} else {
+
+		isComplete = false
+	}
+
+	lcmn.AzTaskResultMgr.AzTaskResultData.NumberOfFiles = numJobOfTask
+	lcmn.AzTaskResultMgr.SetAzTaskResult(lcmn.TaskIDFromParam, lcmn.TaskType, isComplete, skippedJob, finishedJob, failedJob, totalTransferBytes, totalSize)
+
+}
+
+// should be started in a single go routine
+func (lcmn *LifecycleMgrNew) watchInputs() {
+	consoleReader := bufio.NewReader(os.Stdin)
+	for {
+		// sleep for a bit, the option might be enabled later
+		if !lcmn.allowWatchInput {
+			time.Sleep(time.Microsecond * 500)
+			continue
+		}
+
+		// reads input until the first occurrence of \n in the input,
+		input, err := consoleReader.ReadString('\n')
+		if err != nil {
+			continue
+		}
+
+		// remove spaces before/after the content
+		msg := strings.TrimSpace(input)
+		timeReceived := time.Now()
+
+		select {
+		case <-lcmn.waitForUserResponse:
+			lcmn.inputQueue <- userInput{timeReceived: timeReceived, content: msg}
+			continue
+		default:
+		}
+
+		var req LCMMsgReq
+		if lcmn.allowCancelFromStdIn && strings.EqualFold(msg, "cancel") {
+			lcmn.cancelChannel <- os.Interrupt
+		} else if lcmn.e2eAllowAwaitContinue && strings.EqualFold(msg, "continue") {
+			close(lcmn.e2eContinueChannel)
+		} else if lcmn.e2eAllowAwaitOpen && strings.EqualFold(msg, "open") {
+			close(lcmn.e2eAllowOpenChannel)
+		} else if err := json.Unmarshal([]byte(msg), &req); err == nil { //json string
+			lcmn.Info(fmt.Sprintf("Received request for %s with timeStamp %s", req.MsgType, req.TimeStamp.String()))
+			var msgType LCMMsgType
+			if err := msgType.Parse(req.MsgType); err != nil {
+				lcmn.Info(fmt.Sprintf("Discarding incorrect message: %s.", req.MsgType))
+				continue
+			}
+
+			switch msgType {
+			case ELCMMsgType.CancelJob():
+				lcmn.cancelChannel <- os.Interrupt
+			default:
+				m := NewLCMMsg()
+				m.Req = &req
+				lcmn.msgHandlerChannel <- m
+
+				//wait till the message is completed
+				<-m.respChan
+				lcmn.Response(*m.Resp)
+			}
+		} else {
+			lcmn.Info("Discarding incorrectly formatted input message")
+		}
+	}
+}
+
+// get the answer to a question that was asked at a certain time
+// only user input after the specified time is returned to make sure that we are getting the right answer to our question
+// NOTE: to ask a question, go through Prompt, to guarantee that only 1 question is asked at a time
+func (lcmn *LifecycleMgrNew) getInputAfterTime(time time.Time) string {
+	for {
+		msg := <-lcmn.inputQueue
+
+		// keep reading until we find an input that came in after the user specified time
+		if msg.timeReceived.After(time) {
+			return msg.content
+		}
+
+		// otherwise keep waiting as it's possible that the user has not typed it in yet
+	}
+}
+
+func (lcmn *LifecycleMgrNew) EnableInputWatcher() {
+	lcmn.allowWatchInput = true
+}
+
+func (lcmn *LifecycleMgrNew) EnableCancelFromStdIn() {
+	lcmn.allowCancelFromStdIn = true
+}
+
+func (lcmn *LifecycleMgrNew) ClearEnvironmentVariable(variable EnvironmentVariable) {
+	_ = os.Setenv(variable.Name, "")
+}
+
+func (lcmn *LifecycleMgrNew) SetOutputFormat(format OutputFormat) {
+	lcmn.outputFormat = format
+}
+
+func (lcmn *LifecycleMgrNew) checkAndStartCPUProfiling() {
+	// CPU Profiling add-on. Set AZCOPY_PROFILE_CPU to enable CPU profiling,
+	// the value AZCOPY_PROFILE_CPU indicates the path to save CPU profiling data.
+	// e.g. export AZCOPY_PROFILE_CPU="cpu.prof"
+	// For more details, please refer to https://golang.org/pkg/runtime/pprof/
+	cpuProfilePath := lcmn.GetEnvironmentVariable(EEnvironmentVariable.ProfileCPU())
+	if cpuProfilePath != "" {
+		lcmn.Info(fmt.Sprintf("pprof start CPU profiling, and saving profiling data to: %q", cpuProfilePath))
+		f, err := os.Create(cpuProfilePath)
+		if err != nil {
+			lcmn.Error(fmt.Sprintf("Fail to create file for CPU profiling, %v", err))
+		}
+		if err := pprof.StartCPUProfile(f); err != nil {
+			lcmn.Error(fmt.Sprintf("Fail to start CPU profiling, %v", err))
+		}
+	}
+}
+
+func (lcmn *LifecycleMgrNew) checkAndStopCPUProfiling() {
+	// Stop CPU profiling if there is ongoing CPU profiling.
+	pprof.StopCPUProfile()
+}
+
+func (lcmn *LifecycleMgrNew) checkAndTriggerMemoryProfiling() {
+	// Memory Profiling add-on. Set AZCOPY_PROFILE_MEM to enable memory profiling,
+	// the value AZCOPY_PROFILE_MEM indicates the path to save memory profiling data.
+	// e.g. export AZCOPY_PROFILE_MEM="mem.prof"
+	// For more details, please refer to https://golang.org/pkg/runtime/pprof/
+	memProfilePath := lcmn.GetEnvironmentVariable(EEnvironmentVariable.ProfileMemory())
+	if memProfilePath != "" {
+		lcmn.Info(fmt.Sprintf("pprof start memory profiling, and saving profiling data to: %q", memProfilePath))
+		f, err := os.Create(memProfilePath)
+		if err != nil {
+			lcmn.Error(fmt.Sprintf("Fail to create file for memory profiling, %v", err))
+		}
+		runtime.GC()
+		if err := pprof.WriteHeapProfile(f); err != nil {
+			lcmn.Error(fmt.Sprintf("Fail to start memory profiling, %v", err))
+		}
+		if err := f.Close(); err != nil {
+			lcmn.Info(fmt.Sprintf("Fail to close memory profiling file, %v", err))
+		}
+	}
+}
+
+func (lcmn *LifecycleMgrNew) Init(o OutputBuilder) {
+	lcmn.msgQueue <- outputMessage{
+		msgContent: o(lcmn.outputFormat),
+		msgType:    eOutputMessageType.Init(),
+	}
+}
+
+func (lcmn *LifecycleMgrNew) Progress(o OutputBuilder) {
+	messageContent := ""
+	if o != nil {
+		messageContent = o(lcmn.outputFormat)
+	}
+
+	lcmn.msgQueue <- outputMessage{
+		msgContent: messageContent,
+		msgType:    eOutputMessageType.Progress(),
+	}
+}
+
+func (lcmn *LifecycleMgrNew) Info(msg string) {
+
+	msg = lcmn.logSanitizer.SanitizeLogMessage(msg) // sometimes error-like text comes through Info, before the final "we've failed, please stop now" signal comes to Error. So we sanitize in both places.
+
+	infoMsg := fmt.Sprintf("INFO: %v", msg)
+
+	lcmn.msgQueue <- outputMessage{
+		msgContent: infoMsg,
+		msgType:    eOutputMessageType.Info(),
+	}
+}
+
+func (lcmn *LifecycleMgrNew) Prompt(message string, details PromptDetails) ResponseOption {
+
+	expectedInputChannel := make(chan string, 1)
+	lcmn.msgQueue <- outputMessage{
+		msgContent:    message,
+		msgType:       eOutputMessageType.Prompt(),
+		inputChannel:  expectedInputChannel,
+		promptDetails: details,
+	}
+
+	// Request watchInputs() to wait for response from user
+	lcmn.waitForUserResponse <- true
+
+	// block until input comes from the user
+	rawResponse := <-expectedInputChannel
+
+	// match the given response against one of the options we gave
+	for _, option := range details.ResponseOptions {
+		// in case the user misunderstood and typed full response type instead, we still tolerate it
+		// e.g. instead of "y", user typed "Yes"
+		if strings.EqualFold(option.ResponseString, rawResponse) ||
+			strings.EqualFold(option.UserFriendlyResponseType, rawResponse) {
+			return option
+		}
+	}
+
+	// nothing matched our options, assume default behavior (up to whoever that called Prompt)
+	// we don't re-prompt the user since this makes the integration with Stg Exp more complex
+	return EResponseOption.Default()
+}
+
+func (lcmn *LifecycleMgrNew) Dryrun(o OutputBuilder) {
+	dryrunMessage := ""
+	if o != nil {
+		dryrunMessage = o(lcmn.outputFormat)
+	}
+
+	lcmn.msgQueue <- outputMessage{
+		msgContent: dryrunMessage,
+		msgType:    eOutputMessageType.Dryrun(),
+	}
+}
+
+// TODO minor: consider merging with Exit
+func (lcmn *LifecycleMgrNew) Error(msg string) {
+
+	msg = lcmn.logSanitizer.SanitizeLogMessage(msg)
+
+	// Check if need to do memory profiling, and do memory profiling accordingly before azcopy exits.
+	lcmn.checkAndTriggerMemoryProfiling()
+
+	// Check if there is ongoing CPU profiling, and stop CPU profiling.
+	lcmn.checkAndStopCPUProfiling()
+
+	lcmn.msgQueue <- outputMessage{
+		msgContent: msg,
+		msgType:    eOutputMessageType.Error(),
+		exitCode:   EExitCode.Error(),
+	}
+
+	// stall forever until the success message is printed and program exits
+	lcmn.SurrenderControl()
+}
+
+func (lcmn *LifecycleMgrNew) Exit(o OutputBuilder, applicationExitCode ExitCode) {
+	if applicationExitCode != EExitCode.NoExit() {
+		// Check if need to do memory profiling, and do memory profiling accordingly before azcopy exits.
+		lcmn.checkAndTriggerMemoryProfiling()
+
+		// Check if there is ongoing CPU profiling, and stop CPU profiling.
+		lcmn.checkAndStopCPUProfiling()
+	}
+
+	messageContent := ""
+	if o != nil {
+		messageContent = o(lcmn.outputFormat)
+	}
+
+	lcmn.msgQueue <- outputMessage{
+		msgContent: messageContent,
+		msgType:    eOutputMessageType.EndOfJob(),
+		exitCode:   applicationExitCode,
+	}
+
+	if applicationExitCode != EExitCode.NoExit() {
+		// stall forever until the success message is printed and program exits
+		lcmn.SurrenderControl()
+	}
+}
+
+func (lcmn *LifecycleMgrNew) Response(resp LCMMsgResp) {
+
+	var respMsg string
+
+	if lcmn.outputFormat == EOutputFormat.Json() {
+		m, err := json.Marshal(resp)
+		respMsg = string(m)
+		PanicIfErr(err)
+	} else {
+		respMsg = fmt.Sprintf("INFO: %v", resp.Value.String())
+	}
+
+	respMsg = lcmn.logSanitizer.SanitizeLogMessage(respMsg)
+
+	lcmn.msgQueue <- outputMessage{
+		msgContent: respMsg,
+		msgType:    eOutputMessageType.Response(),
+	}
+}
+
+// this is used by commands that wish to stall forever to wait for the operations to complete
+func (lcmn *LifecycleMgrNew) SurrenderControl() {
+	// stall forever
+	select {}
+}
+
+func (lcmn *LifecycleMgrNew) RegisterCloseFunc(closeFunc func()) {
+	lcmn.closeFunc = closeFunc
+}
+
+func (lcmn *LifecycleMgrNew) processOutputMessage() {
+	// this function constantly pulls out message to output
+	// and pass them onto the right handler based on the output format
+	for {
+		msgToPrint := <-lcmn.msgQueue
+
+		if shouldQuietMessage(msgToPrint, lcmn.OutputVerbosityType) {
+			lcmn.processNoneOutput(msgToPrint)
+			continue
+		}
+		switch lcmn.outputFormat {
+		case EOutputFormat.Json():
+			lcmn.processJSONOutput(msgToPrint)
+		case EOutputFormat.Text():
+			lcmn.processTextOutput(msgToPrint)
+		case EOutputFormat.None():
+			lcmn.processNoneOutput(msgToPrint)
+		default:
+			panic("unimplemented output format")
+		}
+	}
+}
+
+func (lcmn *LifecycleMgrNew) processNoneOutput(msgToOutput outputMessage) {
+	if msgToOutput.msgType == eOutputMessageType.Error() {
+		lcmn.closeFunc()
+		os.Exit(int(EExitCode.Error()))
+	} else if msgToOutput.shouldExitProcess() {
+		lcmn.closeFunc()
+		os.Exit(int(msgToOutput.exitCode))
+	}
+
+	// ignore all other outputs
+	return
+}
+
+func (lcmn *LifecycleMgrNew) processJSONOutput(msgToOutput outputMessage) {
+	msgType := msgToOutput.msgType
+	questionTime := time.Now()
+
+	// simply output the json message
+	// we assume the msgContent is already formatted correctly
+	fmt.Println(GetJsonStringFromTemplate(newJsonOutputTemplate(msgType, msgToOutput.msgContent,
+		msgToOutput.promptDetails)))
+
+	// exit if needed
+	if msgToOutput.shouldExitProcess() {
+		lcmn.closeFunc()
+		os.Exit(int(msgToOutput.exitCode))
+	} else if msgType == eOutputMessageType.Prompt() {
+		// read the response to the prompt and send it back through the channel
+		msgToOutput.inputChannel <- lcmn.getInputAfterTime(questionTime)
+	}
+}
+
+func (lcmn *LifecycleMgrNew) processTextOutput(msgToOutput outputMessage) {
+	// when a new line needs to overwrite the current line completely
+	// we need to make sure that if the new line is shorter, we properly erase everything from the current line
+	var matchLengthWithSpaces = func(curLineLength, newLineLength int) {
+		if dirtyLeftover := curLineLength - newLineLength; dirtyLeftover > 0 {
+			for i := 0; i < dirtyLeftover; i++ {
+				fmt.Print(" ")
+			}
+		}
+	}
+
+	switch msgToOutput.msgType {
+	case eOutputMessageType.Error(), eOutputMessageType.EndOfJob():
+		// simply print and quit
+		// if no message is intended, avoid adding new lines
+		if msgToOutput.msgContent != "" {
+			fmt.Println("\n" + msgToOutput.msgContent)
+		}
+		if msgToOutput.shouldExitProcess() {
+			lcmn.closeFunc()
+			os.Exit(int(msgToOutput.exitCode))
+		}
+
+	case eOutputMessageType.Progress():
+		fmt.Print("\r")                   // return carriage back to start
+		fmt.Print(msgToOutput.msgContent) // print new progress
+
+		// it is possible that the new progress status is somehow shorter than the previous one
+		// in this case we must erase the left over characters from the previous progress
+		matchLengthWithSpaces(len(lcmn.progressCache), len(msgToOutput.msgContent))
+
+		lcmn.progressCache = msgToOutput.msgContent
+
+	case eOutputMessageType.Init(), eOutputMessageType.Info(), eOutputMessageType.Dryrun(), eOutputMessageType.Response():
+		if lcmn.progressCache != "" { // a progress status is already on the last line
+			// print the info from the beginning on current line
+			fmt.Print("\r")
+			fmt.Print(msgToOutput.msgContent)
+
+			// it is possible that the info is shorter than the progress status
+			// in this case we must erase the left over characters from the progress status
+			matchLengthWithSpaces(len(lcmn.progressCache), len(msgToOutput.msgContent))
+
+			// print the previous progress status again, so that it's on the last line
+			fmt.Print("\n")
+			fmt.Print(lcmn.progressCache)
+		} else {
+			fmt.Println(msgToOutput.msgContent)
+		}
+	case eOutputMessageType.Prompt():
+		questionTime := time.Now()
+
+		if lcmn.progressCache != "" { // a progress status is already on the last line
+			// print the prompt from the beginning on current line
+			fmt.Print("\r")
+			fmt.Print(msgToOutput.msgContent)
+
+			// it is possible that the prompt is shorter than the progress status
+			// in this case we must erase the left over characters from the progress status
+			matchLengthWithSpaces(len(lcmn.progressCache), len(msgToOutput.msgContent))
+
+		} else {
+			fmt.Print(msgToOutput.msgContent)
+		}
+
+		// example output: Please confirm with: [Y] Yes  [N] No  [A] Yes for all  [L] No for all
+		fmt.Print(" Please confirm with:")
+		for _, option := range msgToOutput.promptDetails.ResponseOptions {
+			fmt.Printf(" [%s] %s ", strings.ToUpper(option.ResponseString), option.UserFriendlyResponseType)
+		}
+
+		// read the response to the prompt and send it back through the channel
+		msgToOutput.inputChannel <- lcmn.getInputAfterTime(questionTime)
+	}
+}
+
+// for the LifecycleMgrNew to babysit a job, it must be given a controller to get information about the job
+type WorkController interface {
+	Cancel(mgr LifecycleMgrNew)                                        // handle to cancel the work
+	ReportProgressOrExit(mgr LifecycleMgrNew) (totalKnownCount uint32) // print the progress status, optionally exit the application if work is done
+}
+
+// AllowReinitiateProgressReporting must be called before running an cleanup job, to allow the initiation of that job's
+// progress reporting to begin
+func (lcmn *LifecycleMgrNew) AllowReinitiateProgressReporting() {
+	atomic.StoreInt32(&lcmn.waitEverCalled, 0)
+}
+
+// isInteractive indicates whether the application was spawned by an actual user on the command
+func (lcmn *LifecycleMgrNew) InitiateProgressReporting(jc WorkController) {
+	if !atomic.CompareAndSwapInt32(&lcmn.waitEverCalled, 0, 1) {
+		return
+	}
+
+	// this go routine never returns
+	// it will terminate the whole process eventually when the work is complete
+	go func() {
+		const progressFrequencyThreshold = 1000000
+		var oldCount, newCount uint32
+		wait := 2 * time.Second
+		lastFetchTime := time.Now().Add(-wait) // So that we start fetching time immediately
+
+		// cancelChannel will be notified when os receives os.Interrupt and os.Kill signals
+		signal.Notify(lcmn.cancelChannel, os.Interrupt, os.Kill)
+
+		cancelCalled := false
+
+		doCancel := func() {
+			cancelCalled = true
+			lcmn.Info("Cancellation requested. Beginning clean shutdown...")
+			jc.Cancel(lcm)
+		}
+
+		for {
+			select {
+			case <-lcmn.cancelChannel:
+				doCancel()
+				continue // to exit on next pass through loop
+			case <-lcmn.doneChannel:
+
+				newCount = jc.ReportProgressOrExit(lcm)
+				lastFetchTime = time.Now()
+			case <-time.After(wait):
+				if time.Since(lastFetchTime) >= wait {
+					newCount = jc.ReportProgressOrExit(lcm)
+					lastFetchTime = time.Now()
+				}
+			}
+
+			if newCount >= progressFrequencyThreshold && !cancelCalled {
+				// report less on progress  - to save on the CPU costs of doing so and because, if there are this many files,
+				// its going to be a long job anyway, so no need to report so often
+				wait = 2 * time.Minute
+				if oldCount < progressFrequencyThreshold {
+					lcmn.Info(fmt.Sprintf("Reducing progress output frequency to %v, because there are over %d files", wait, progressFrequencyThreshold))
+				}
+			}
+
+			oldCount = newCount
+		}
+	}()
+}
+
+func (lcmn *LifecycleMgrNew) GetEnvironmentVariable(env EnvironmentVariable) string {
+	value := os.Getenv(env.Name)
+	if value == "" {
+		return env.DefaultValue
+	}
+	return value
+}
+
+func (lcmn *LifecycleMgrNew) AddUserAgentPrefix(userAgent string) string {
+	prefix := lcmn.GetEnvironmentVariable(EEnvironmentVariable.UserAgentPrefix())
+	if len(prefix) > 0 {
+		userAgent = prefix + " " + userAgent
+	}
+
+	return userAgent
+}
+
+func (_ *LifecycleMgrNew) awaitChannel(ch chan struct{}, timeout time.Duration) {
+	select {
+	case <-ch:
+	case <-time.After(timeout):
+	}
+}
+
+// E2EAwaitContinue is used in case where a developer want's to debug AzCopy by attaching to the running process,
+// before it starts doing any actual work.
+func (lcmn *LifecycleMgrNew) E2EAwaitContinue() {
+	lcmn.e2eAllowAwaitContinue = true // not technically gorountine safe (since its shared state) but its consistent with EnableInputWatcher
+	lcmn.EnableInputWatcher()
+	lcmn.awaitChannel(lcmn.e2eContinueChannel, time.Minute)
+}
+
+// E2EAwaitAllowOpenFiles is used in cases where we want to artificially produce a pause between enumeration and sending
+// of the first file, for test purposes. (It only achieves that effect when the total file count is <= size of one job part).
+// Does not pause at all, unless the feature has been enabled with a command-line flag.
+func (lcmn *LifecycleMgrNew) E2EAwaitAllowOpenFiles() {
+	lcmn.awaitChannel(lcmn.e2eAllowOpenChannel, 5*time.Minute)
+}
+
+func (lcmn *LifecycleMgrNew) E2EEnableAwaitAllowOpenFiles(enable bool) {
+	if enable {
+		lcmn.e2eAllowAwaitOpen = true // not technically gorountine safe (since its shared state) but its consistent with EnableInputWatcher
+		lcmn.EnableInputWatcher()
+	} else {
+		close(lcmn.e2eAllowOpenChannel) // so that E2EAwaitAllowOpenFiles will instantly return every time
+	}
+}
+
+// Fetching `AZCOPY_DISABLE_SYSLOG` from the environment variables and
+// setting `disableSyslog` flag in LifeCycleManager to avoid Env Vars Lookup redundantly
+func (lcmn *LifecycleMgrNew) SetForceLogging() {
+	disableSyslog, err := strconv.ParseBool(lcmn.GetEnvironmentVariable(EEnvironmentVariable.DisableSyslog()))
+	if err != nil {
+		// By default, we'll retain the current behaviour. i.e. To log in Syslog/WindowsEventLog if not specified by the user
+		disableSyslog = false
+	}
+	lcmn.disableSyslog = disableSyslog
+}
+
+func (lcmn *LifecycleMgrNew) IsForceLoggingDisabled() bool {
+	return lcmn.disableSyslog
+}
+
+func (lcmn *LifecycleMgrNew) DownloadToTempPath() bool {
+	ret, err := strconv.ParseBool(lcmn.GetEnvironmentVariable(EEnvironmentVariable.DownloadToTempPath()))
+	if err != nil {
+		// By default we'll download to temp path
+		ret = true
+	}
+	return ret
+}
+
+func (lcmn *LifecycleMgrNew) MsgHandlerChannel() <-chan *LCMMsg {
+	return lcmn.msgHandlerChannel
+}
+
+func (lcmn *LifecycleMgrNew) ReportAllJobPartsDone() {
+	lcmn.doneChannel <- true
+}
+
+func (lcmn *LifecycleMgrNew) SetOutputVerbosity(mode OutputVerbosity) {
+	lcmn.OutputVerbosityType = mode
+}
+
+// captures the common logic of exiting if there's an expected error
+func PanicIfErr(err error) {
+	if err != nil {
+		panic(err)
+	}
+}
+
+func shouldQuietMessage(msgToOutput outputMessage, quietMode OutputVerbosity) bool {
+	messageType := msgToOutput.msgType
+
+	switch quietMode {
+	case EOutputVerbosity.Default():
+		return false
+	case EOutputVerbosity.Essential():
+		return messageType == eOutputMessageType.Progress() || messageType == eOutputMessageType.Info() || messageType == eOutputMessageType.Prompt()
+	case EOutputVerbosity.Quiet():
+		return true
+	default:
+		return false
+	}
+}
+
+// GetAzureKeys get keys (bucket name, storage credential, aws credential, cosmos db credential, and cosmos db partition key range for MigrationTasks)
+func (lcmn *LifecycleMgrNew) GetAzureKeys(jobId string) {
+
+	//Decrypt redis cache with AES 128
+	redisHost, redisPWD, redisSSL, err := util.GetAzureRedisCredential("RedisCache", jobId)
+	if err != nil {
+		lcmn.GetKeyVault()
+	}
+
+	if len(redisHost) != 0 {
+		os.Setenv(Redis_Host, redisHost)
+		os.Setenv(Redis_PWD, redisPWD)
+	}
+	//TODO exit if redisHost is empty
+
+	bucketName := os.Getenv("SOURCE_BUCKET")
+	storageAccount := os.Getenv("AZ_BLOB_STORAGE_ACCOUNT")
+	awsKeyId := fmt.Sprintf("%s-%s", bucketName, "AWSACCESSKEYID")
+	awsSecretKeyId := fmt.Sprintf("%s-%s", bucketName, "AWSSECRETACCESSKEY")
+
+	//Set Redis client (with or without ssl)
+	if lcmn.JobDataRedisClient == nil {
+		if ok, _ := strconv.ParseBool(redisSSL); ok {
+			lcmn.JobDataRedisClient = goredis.NewClient(&goredis.Options{
+				Addr:      os.Getenv(Redis_Host),
+				Password:  os.Getenv(Redis_PWD),
+				DB:        0,
+				TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+			})
+		} else {
+			lcmn.JobDataRedisClient = goredis.NewClient(&goredis.Options{
+				Addr:     os.Getenv(Redis_Host),
+				Password: os.Getenv(Redis_PWD),
+				DB:       0,
+			})
+		}
+	}
+
+	//Get Env from Redis or Key Vault. If the value is not exist in Redis, read from Key Vault and cache into Redis
+
+	storageConn := getAzureKeyFromRedisOrKeyVault(storageAccount)
+	aws_access_key_id := getAzureKeyFromRedisOrKeyVault(awsKeyId)
+	aws_secret_access_key := getAzureKeyFromRedisOrKeyVault(awsSecretKeyId)
+	eventhubconnStrFull := getAzureKeyFromRedisOrKeyVault("EventHubNameSpace--Full--FullyQualifiedNamespace")
+	eventhubNameFullTask := getAzureKeyFromRedisOrKeyVault("EventHubNameSpace--Full--EventHubName--Task")
+	eventhubNameFullJob := getAzureKeyFromRedisOrKeyVault("EventHubNameSpace--Full--EventHubName--Job")
+
+	eventhubconnStrDelta := getAzureKeyFromRedisOrKeyVault("EventHubNameSpace--Delta--FullyQualifiedNamespace")
+	eventhubNameUpsertTask := getAzureKeyFromRedisOrKeyVault("EventHubNameSpace--Delta--EventHubName--UpsertTask")
+	eventhubNameUpsertJob := getAzureKeyFromRedisOrKeyVault("EventHubNameSpace--Delta--EventHubName--UpsertJob")
+
+	eventhubNameDeleteTask := getAzureKeyFromRedisOrKeyVault("EventHubNameSpace--Delta--EventHubName--DeleteTask")
+	eventhubNameDeleteJob := getAzureKeyFromRedisOrKeyVault("EventHubNameSpace--Delta--EventHubName--DeleteJob")
+
+	// lcmn.AzTaskResultMgr = dbmgr.GetTaskEventHubClient(eventhubconnStrFull, eventhubNameFullTask)
+	// lcmn.AzJobResultMgr = dbmgr.GetJobEventHubClient(eventhubconnStrFull, eventhubNameFullJob)
+
+	//Exit if any of these Envs are not exist.
+	//if len(storageConn) == 0 || len(aws_access_key_id) == 0 || len(aws_secret_access_key) == 0 || len(cosmosdbConn) == 0 {
+	if len(storageConn) == 0 || len(aws_access_key_id) == 0 || len(aws_secret_access_key) == 0 || len(eventhubconnStrFull) == 0 {
+
+		glog.Error("Cannot get keys (pkrange, storage conn, aws access key id, eventhub conn, aws secret access key) from key vault or redis")
+		os.Exit(-1)
+	}
+
+	//Add Envs into system Env Value (Project Global Var)
+	os.Setenv("AZCOPY_PARALLEL_STAT_FILES", "true")
+	os.Setenv("AWS_ACCESS_KEY_ID", aws_access_key_id)
+	os.Setenv("AWS_SECRET_ACCESS_KEY", aws_secret_access_key)
+	os.Setenv("AZ_BLOB_CONN_STRING", storageConn)
+	//630
+	os.Setenv(Full_EventHub_ConnStr, eventhubconnStrFull)
+	os.Setenv(Full_EventHub_Task, eventhubNameFullTask)
+	os.Setenv(Full_EventHub_Job, eventhubNameFullJob)
+
+	os.Setenv(Delta_EventHub_ConnStr, eventhubconnStrDelta)
+	os.Setenv(Delta_EventHub_UpsertTask, eventhubNameUpsertTask)
+	os.Setenv(Delta_EventHub_UpsertJob, eventhubNameUpsertJob)
+
+	os.Setenv(Delta_EventHub_DeleteTask, eventhubNameDeleteTask)
+	os.Setenv(Delta_EventHub_DeleteJob, eventhubNameDeleteJob)
+
+}

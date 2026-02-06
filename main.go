@@ -1,0 +1,226 @@
+// Copyright © 2017 Microsoft <wastore@microsoft.com>
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+
+package main
+
+import (
+	"flag"
+	"fmt"
+	"io/ioutil"
+	"log"
+	"math/rand"
+	"net/http"
+	_ "net/http/pprof"
+	"os"
+	"os/signal"
+	"path"
+	"runtime"
+	"runtime/debug"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/Azure/azure-pipeline-go/pipeline"
+	"github.com/gogf/gf/os/glog"
+
+	"github.com/Azure/azure-storage-azcopy/v10/cmd"
+	"github.com/Azure/azure-storage-azcopy/v10/common"
+	"github.com/Azure/azure-storage-azcopy/v10/util"
+)
+
+// get the lifecycle manager to print messages
+var glcm = common.GetLifecycleMgr()
+
+func main() {
+	glog.Info("AzCopy version 10.16.0-Customize-0.16 for Azure Blob Storage")
+	//Parse input "-t -j" args
+	inputArgs := os.Args
+	fmt.Println(inputArgs)
+	if inputArgs[1] == "copy" || inputArgs[1] == "remove" {
+
+		taskID, jobsID, overwriteOpt, azLogLevel := util.ArgsParser(inputArgs)
+
+		glog.Infof("overwriteOpt is %s; log Level is %s", overwriteOpt, azLogLevel)
+
+		setGlogVerbosity(azLogLevel)
+
+		pipeline.SetLogSanitizer(common.NewAzCopyLogSanitizer()) // make sure SyslogDisabled logs get secrets redacted
+		rand.Seed(time.Now().UnixNano())                         // make sure our random numbers actually are random (but remember, use crypto/rand for anything where strong/reliable randomness is required
+		//azcopyLogPathFolder := common.GetLifecycleMgr().GetEnvironmentVariable(common.EEnvironmentVariable.LogLocation())     // user specified location for log files
+		//azcopyJobPlanFolder := common.GetLifecycleMgr().GetEnvironmentVariable(common.EEnvironmentVariable.JobPlanLocation()) // user specified location for plan files
+
+		//Load config.yaml file
+		glcm.LoadConfigurationFileFromYaml(taskID, jobsID)
+
+		//Retrieve env from key vault or redis, add to sys env.
+		glcm.GetAzureKeys(jobsID)
+
+		//Get task detail information
+		glog.Debug("Get job data from json")
+		argsData := glcm.GetJobDataFromjsonfileGCS(taskID, jobsID)
+
+		//Add a task start time (RFC3339) into Cosmos DB
+		glcm.SetTaskExecutionStartTime()
+
+		//Init Cosmos DB Manager
+		//glcm.SetJobCosmosMgr()
+		//argsData = append(argsData, overwriteOpt)
+
+		//Overwrite Azcopy args
+		os.Args = argsData
+		glcm.SetOverwriteIfNew(overwriteOpt)
+	} //end if copy
+
+	//for azure mi
+	azcopyLogPathFolder := common.GetLifecycleMgr().GetEnvironmentVariable(common.EEnvironmentVariable.LogLocation())     // user specified location for log files
+	azcopyJobPlanFolder := common.GetLifecycleMgr().GetEnvironmentVariable(common.EEnvironmentVariable.JobPlanLocation()) // user specified location for plan files
+
+	// note: azcopyAppPathFolder is the default location for all AzCopy data (logs, job plans, oauth token on Windows)
+	// but all the above can be put elsewhere as they can become very large
+	azcopyAppPathFolder := GetAzCopyAppPath()
+
+	// the user can optionally put the log files somewhere else
+	if azcopyLogPathFolder == "" {
+		azcopyLogPathFolder = azcopyAppPathFolder
+	}
+	if err := os.Mkdir(azcopyLogPathFolder, os.ModeDir|os.ModePerm); err != nil && !os.IsExist(err) {
+		log.Fatalf("Problem making .azcopy directory. Try setting AZCOPY_LOG_LOCATION env variable. %v", err)
+	}
+
+	// the user can optionally put the plan files somewhere else
+	if azcopyJobPlanFolder == "" {
+		// make the app path folder ".azcopy" first so we can make a plans folder in it
+		if err := os.Mkdir(azcopyAppPathFolder, os.ModeDir); err != nil && !os.IsExist(err) {
+			common.PanicIfErr(err)
+		}
+		azcopyJobPlanFolder = path.Join(azcopyAppPathFolder, "plans")
+	}
+	if err := os.Mkdir(azcopyJobPlanFolder, os.ModeDir|os.ModePerm); err != nil && !os.IsExist(err) {
+		log.Fatalf("Problem making .azcopy directory. Try setting AZCOPY_PLAN_FILE_LOCATION env variable. %v", err)
+	}
+
+	jobID := common.NewJobID()
+
+	// If insufficient arguments, show usage & terminate
+	if len(os.Args) == 1 {
+		cmd.Execute(azcopyLogPathFolder, azcopyJobPlanFolder, 0, jobID)
+		return
+	}
+
+	configureGoMaxProcs()
+	configureGC()
+
+	// Perform os specific initialization
+	maxFileAndSocketHandles, err := ProcessOSSpecificInitialization()
+	if err != nil {
+		log.Fatalf("initialization failed: %v", err)
+	}
+
+	//setupSignalHandler(jobsID, azcopyJobPlanFolder)
+
+	cmd.Execute(azcopyLogPathFolder, azcopyJobPlanFolder, maxFileAndSocketHandles, jobID)
+
+	glcm.Exit(nil, common.EExitCode.Success())
+}
+
+// Golang's default behaviour is to GC when new objects = (100% of) total of objects surviving previous GC.
+// But our "survivors" add up to many GB, so its hard for users to be confident that we don't have
+// a memory leak (since with that default setting new GCs are very rare in our case). So configure them to be more frequent.
+func configureGC() {
+	go func() {
+		time.Sleep(20 * time.Second) // wait a little, so that our initial pool of buffers can get allocated without heaps of (unnecessary) GC activity
+		debug.SetGCPercent(20)       // activate more aggressive/frequent GC than the default
+	}()
+}
+
+// Ensure we always have more than 1 OS thread running goroutines, since there are issues with having just 1.
+// (E.g. version check doesn't happen at login time, if have only one go proc. Not sure why that happens if have only one
+// proc. Is presumably due to the high CPU usage we see on login if only 1 CPU, even tho can't see any busy-wait in that code)
+func configureGoMaxProcs() {
+	isOnlyOne := runtime.GOMAXPROCS(0) == 1
+	if isOnlyOne {
+		runtime.GOMAXPROCS(2)
+	}
+}
+
+func init() {
+
+	//glog.SetLevel(glog.LEVEL_ERRO)
+
+	if os.Getenv("DEBUG_MODE") == "1" {
+		go func() {
+			glog.Println(http.ListenAndServe("localhost:8080", nil))
+		}()
+
+		glog.SetLevel(glog.LEVEL_ALL)
+	}
+}
+
+func setupSignalHandler(jobID string, azcopyJobPlanFolder string) {
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-c
+		cleanUpIncompleteFiles(jobID, azcopyJobPlanFolder)
+		os.Exit(1)
+	}()
+}
+
+func cleanUpIncompleteFiles(jobID string, azcopyJobPlanFolder string) {
+	files, err := ioutil.ReadDir(azcopyJobPlanFolder)
+	if err != nil {
+		glog.Println("Error reading directory:", err)
+		return
+	}
+	for _, file := range files {
+		if strings.Contains(file.Name(), jobID) && !isFileComplete(file) {
+			os.Remove(path.Join(azcopyJobPlanFolder, file.Name()))
+		}
+	}
+}
+func isFileComplete(file os.FileInfo) bool {
+	// Logic to determine if the file is complete
+	return false
+	// Placeholder
+}
+
+func setGlogVerbosity(azLogLevel string) {
+	var verbosityLevel int
+	switch azLogLevel {
+	case "NONE":
+		verbosityLevel = glog.LEVEL_NONE
+	//turn off glog
+	case "ERROR":
+		verbosityLevel = glog.LEVEL_ERRO
+	//basic errors
+	case "WARNING":
+		verbosityLevel = glog.LEVEL_WARN
+	case "INFO":
+		verbosityLevel = glog.LEVEL_INFO
+	case "DEBUG":
+		verbosityLevel = glog.LEVEL_ALL
+	//verbose logging
+	default:
+		verbosityLevel = glog.LEVEL_NONE
+	}
+	flag.Set("v", strconv.Itoa(verbosityLevel))
+	glog.SetLevel(verbosityLevel)
+}

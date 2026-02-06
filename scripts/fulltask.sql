@@ -1,0 +1,1 @@
+.create table fullTask (['id']: guid, taskId: string, taskType: string, numberOfFiles: int, isCompleted: bool, finishedJob: int, failedJob: int, executionStartTime: datetime, completedTime: datetime, totalTransferBytes: long, totalSize: long, skippedJob: int)  

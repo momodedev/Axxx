@@ -1,0 +1,1 @@
+.create table fullJob (['id']: guid, JobId: string, TaskId: string, TaskType: string, Message: string, OperationTime: datetime, ModifyTime: datetime, StorageClass: string, StatusCode: int, Size: long, SourceUrl: string, DestinationURL: string, ModifyTime_1: string, Size_1: int, ModifyTime_2: string, Size_2: int) 

@@ -1,0 +1,13 @@
+13 : For MI, change to use endpoint uri for Azure Storage Account Blob and Azure Cache Redis, Azure Eventhub
+12 : For MI, Remove the conntion string for Azure Storage Account Blob and Azure Cache Redis, Azure Eventhub
+11 : Add the scripts for ADX tables
+10 : Fix log output for reading/write Azure Key Vault
+9 : Upgrade AWS SDK Go for S3 from v1.54.16 to v1.55.5
+8 : Upgrade Azure SDK Go for Event Hub from v1.0.1 to v1.2.2
+7 : Upgrade Azure SDK Go for azblob to 1.4.1
+6 : Upgrade Go v1.17 to Go v1.23.1
+5 : Upgrade Azure SDK Go for Redis from v8.11.5 to v9.6.1
+4 : For running the azcopy login and azcopy copy in azcopy.bat
+3 : For retry sending to eventhub, update azblob_client.go
+2 : For unit testing, Add json files for testing
+1 : for MI, Remove the SAS token generation

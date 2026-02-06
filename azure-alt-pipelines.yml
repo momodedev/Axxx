@@ -1,0 +1,33 @@
+# azure-pipelines.yml
+trigger:
+  branches:
+    include:
+    - source_change
+
+jobs:
+- job: build
+  displayName: 'Build Golang Application on Windows'
+  pool:
+    vmImage: 'windows-latest'
+
+  steps:
+  - script: |
+      echo 'Installing Go'
+      choco install golang
+    displayName: 'Install Go'
+
+  - script: |
+      echo 'Set up GOPATH'
+      echo '##vso[task.setvariable variable=GOROOT]C:\Program Files\Go'
+      echo '##vso[task.setvariable variable=GOPATH]$(System.DefaultWorkingDirectory)\gopath'
+    displayName: 'Setup Env'
+
+  - script: |
+      echo 'Get Dependency'
+      go get -v
+    displayName: 'Get Dependency'
+
+  - script: |
+      echo 'Compiling ...'
+      go build -o azcopy-alt-windows.exe
+    displayName: 'Compile Go'

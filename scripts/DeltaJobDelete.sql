@@ -1,0 +1,1 @@
+.create table DeltaJobDelete (['id']: guid, JobId: string, TaskId: string, TaskType: string, Message: string, OperationTime: datetime, ModifyTime: string, StorageClass: string, StatusCode: int, Size: long, SourceUrl: string, DestinationURL: string, ModifyTime_1: datetime, ModifyTime_2: datetime)    

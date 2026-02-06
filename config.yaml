@@ -1,0 +1,19 @@
+REDIS_HOST: "s32adls-uat.redis.cache.windows.net:6380"
+REDIS_PSW: ""
+
+COSMOS_ENDPOINT: "https://s32adls-dev.documents.azure.com:443/"
+COSMOS_KEY: ""
+COSMOS_DB: "DataMigration"
+COSMOS_CONTAINER_JOB: "MigrationTasks"
+COSMOS_CONTAINER_TASK: "orctask"
+
+LOCAL_WORK_MODE: 0
+
+LIMITER_FROM_S3_TO_LOCAL: 5
+LIMITER_FROM_LOCAL_TO_AZ: 5
+LIMITER_FROM_S3_TO_AZ: 5
+
+DEBUG_MODE: 1
+
+AZCOPY_CONCURRENCY_VALUE: 3000
+AZ_KEYVAULT: "s32adls-uat"
